@@ -1,0 +1,34 @@
+[
+  {
+    "ParameterKey": "EnvironmentName",
+    "ParameterValue": "udagram"
+  },
+  {
+    "ParameterKey": "StaticBucketName",
+    "ParameterValue": "REPLACE_WITH_UNIQUE_BUCKET"
+  },
+  {
+    "ParameterKey": "InstanceType",
+    "ParameterValue": "t2.micro"
+  },
+  {
+    "ParameterKey": "DesiredCapacity",
+    "ParameterValue": "4"
+  },
+  {
+    "ParameterKey": "MinSize",
+    "ParameterValue": "4"
+  },
+  {
+    "ParameterKey": "MaxSize",
+    "ParameterValue": "6"
+  },
+  {
+    "ParameterKey": "VolumeSize",
+    "ParameterValue": "16"
+  },
+  {
+    "ParameterKey": "KeyName",
+    "ParameterValue": ""
+  }
+]

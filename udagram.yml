@@ -1,0 +1,276 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Udagram (Ubuntu 22.04) — ALB + ASG in PUBLIC subnets, S3 static, optional SSH.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: udagram
+
+  StaticBucketName:
+    Type: String
+    Description: Globally-unique S3 bucket name for static content (public-read)
+
+  InstanceType:
+    Type: String
+    Default: t2.micro
+    AllowedValues: [ t2.micro, t3.micro, t3.small, t3a.micro ]
+
+  DesiredCapacity:
+    Type: Number
+    Default: 4
+  MinSize:
+    Type: Number
+    Default: 4
+  MaxSize:
+    Type: Number
+    Default: 6
+
+  VolumeSize:
+    Type: Number
+    Default: 16
+    Description: Root EBS volume size (GB, gp3)
+
+  # SSH controls (OFF by default — only enable when you need shell access)
+  EnableSSH:
+    Type: String
+    AllowedValues: [ 'true', 'false' ]
+    Default: 'false'
+    Description: Set to 'true' to allow SSH from SSHCidr to the app instances
+  SSHCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: Your IP in CIDR when EnableSSH=true (e.g., 49.204.x.y/32)
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: ''
+    Description: Existing EC2 KeyPair name in this region (required if EnableSSH='true')
+
+  # Ubuntu 22.04 AMI (region-agnostic via SSM)
+  UbuntuAmi:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: /aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id
+
+Conditions:
+  UseKey: !Not [ !Equals [ !Ref KeyName, '' ] ]
+  OpenSSH: !Equals [ !Ref EnableSSH, 'true' ]
+
+Resources:
+  # S3 for static content
+  StaticBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref StaticBucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-static'
+
+  StaticBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref StaticBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowPublicRead
+            Effect: Allow
+            Principal: "*"
+            Action: s3:GetObject
+            Resource: !Sub '${StaticBucket.Arn}/*'
+
+  # Security groups
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP from the world
+      VpcId: !ImportValue
+        Fn::Sub: '${EnvironmentName}-VpcId'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-alb-sg'
+
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP from ALB only; optional SSH from your IP; egress open
+      VpcId: !ImportValue
+        Fn::Sub: '${EnvironmentName}-VpcId'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+        - !If
+          - OpenSSH
+          - { IpProtocol: tcp, FromPort: 22, ToPort: 22, CidrIp: !Ref SSHCidr }
+          - { Ref: AWS::NoValue }
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-app-sg'
+
+  # IAM for instances (S3 RW + SSM)
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: StaticBucketRW
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${StaticBucket.Arn}'
+                  - !Sub '${StaticBucket.Arn}/*'
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [ !Ref InstanceRole ]
+
+  # Launch template 
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        IamInstanceProfile:
+          Name: !Ref InstanceProfile   
+        ImageId: !Ref UbuntuAmi
+        InstanceType: !Ref InstanceType
+        KeyName: !If [ UseKey, !Ref KeyName, !Ref 'AWS::NoValue' ]
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: true
+            Groups: [ !Ref AppSecurityGroup ]
+        BlockDeviceMappings:
+          - DeviceName: /dev/sda1
+            Ebs:
+              VolumeSize: !Ref VolumeSize
+              VolumeType: gp3
+              Encrypted: true
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -euxo pipefail
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -y
+            apt-get install -y nginx awscli
+            systemctl enable nginx
+            LOG=/var/log/udagram-userdata.log
+            exec > >(tee -a ${LOG} | logger -t user-data -s 2>/dev/console) 2>&1
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -y
+            apt-get install -y nginx awscli
+            CONTENT_DIR=/var/www/udagram
+            mkdir -p "${CONTENT_DIR}"
+            BUCKET="${StaticBucketName}"
+            n=0; until [ $n -ge 5 ]; do aws s3 ls "s3://${BUCKET}/" && break; n=$((n+1)); sleep 5; done
+            if ! aws s3 ls "s3://${BUCKET}/index.html"; then echo "ERROR: index.html missing"; exit 1; fi
+            aws s3 sync "s3://${BUCKET}/" "${CONTENT_DIR}/" --delete --exact-timestamps
+            chown -R www-data:www-data "${CONTENT_DIR}"
+            DEFAULT=/etc/nginx/sites-available/default
+            sed -i 's|root /var/www/html;|root /var/www/udagram;|' ${DEFAULT}
+            sed -i 's/index index.html index.htm index.nginx-debian.html;/index index.html;/' ${DEFAULT}
+            systemctl enable nginx
+            systemctl restart nginx
+
+  # ALB + TG + Listener
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !ImportValue
+        Fn::Sub: '${EnvironmentName}-VpcId'
+      Port: 80
+      Protocol: HTTP
+      TargetType: instance
+      HealthCheckPath: /
+      Matcher:
+        HttpCode: 200
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-tg'
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      Type: application
+      Subnets: !Split
+        - ","
+        - !ImportValue
+          Fn::Sub: '${EnvironmentName}-PublicSubnets'
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-alb'
+
+  Listener80:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # ASG in PUBLIC subnets 
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier: !Split
+        - ","
+        - !ImportValue
+          Fn::Sub: '${EnvironmentName}-PrivateSubnets'
+      MinSize: !Ref MinSize
+      MaxSize: !Ref MaxSize
+      DesiredCapacity: !Ref DesiredCapacity
+      TargetGroupARNs: [ !Ref TargetGroup ]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 120
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-app'
+          PropagateAtLaunch: true
+
+Outputs:
+  AlbDNSName:
+    Description: ALB DNS Name
+    Value: !GetAtt LoadBalancer.DNSName
+  AlbURL:
+    Description: Convenience URL
+    Value: !Sub 'http://${LoadBalancer.DNSName}'
+    
+
+  
